@@ -82,7 +82,8 @@ def authenticate_fragment():
         payload = {
             "api_key": FRAGMENT_API_KEY,
             "phone_number": FRAGMENT_PHONE,
-            "mnemonics": mnemonics_list
+            "mnemonics": mnemonics_list,
+            "version": "V4R2"
         }
         res = requests.post(f"{FRAGMENT_API_URL}/auth/authenticate/", json=payload)
         if res.status_code == 200:
@@ -375,3 +376,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
