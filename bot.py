@@ -5,6 +5,9 @@ import json
 import re
 import requests
 import telebot
+import lxml
+import requests_toolbelt
+import bs4
 from dotenv import load_dotenv
 from FunPayAPI import Account
 from FunPayAPI.updater.runner import Runner
@@ -350,3 +353,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
