@@ -36,12 +36,12 @@ FRAGMENT_PHONE = os.getenv("FRAGMENT_PHONE")
 FRAGMENT_MNEMONICS = os.getenv("FRAGMENT_MNEMONICS")
 
 
-
 def clean_username(username):
     """Очищает username от лишних символов @"""
     if username:
         return username.lstrip('@').strip()
     return username
+
 
 def send_telegram_notification(message):
     """Отправляет уведомление в Telegram"""
@@ -50,6 +50,7 @@ def send_telegram_notification(message):
         logger.info("✅ Уведомление отправлено в Telegram")
     except Exception as e:
         logger.error(f"❌ Ошибка отправки в Telegram: {e}")
+
 
 def get_fragment_balance():
     """Получает баланс Fragment"""
@@ -71,15 +72,18 @@ def get_fragment_balance():
         logger.error(f"❌ Исключение при получении баланса: {e}")
         return 0
 
+
 def load_fragment_token():
     if os.path.exists(TOKEN_FILE):
         with open(TOKEN_FILE, "r") as f:
             return json.load(f).get("token")
     return None
 
+
 def save_fragment_token(token):
     with open(TOKEN_FILE, "w") as f:
         json.dump({"token": token}, f)
+
 
 def authenticate_fragment():
     try:
@@ -110,6 +114,7 @@ def authenticate_fragment():
         logger.error(f"❌ Исключение при авторизации Fragment: {e}")
         return None
 
+
 def check_username_exists(username):
     global FRAGMENT_TOKEN
     clean_user = clean_username(username)
@@ -129,6 +134,7 @@ def check_username_exists(username):
         logger.error(f"❌ Ошибка при проверке ника: {e}")
         return False
 
+
 def direct_send_stars(token, username, quantity):
     try:
         clean_user = clean_username(username)
@@ -143,6 +149,7 @@ def direct_send_stars(token, username, quantity):
         return False, res.text
     except Exception as e:
         return False, str(e)
+
 
 def parse_fragment_error(response_text):
     try:
@@ -163,6 +170,7 @@ def parse_fragment_error(response_text):
         if any("Unknown error" in str(e) for e in data):
             return "❌ Неизвестная ошибка. Сейчас оформим возврат средств."
     return "❌ Ошибка обработки заказа."
+
 
 def refund_order(account, order_id, chat_id):
     try:
@@ -189,16 +197,18 @@ def refund_order(account, order_id, chat_id):
         account.send_message(chat_id, "❌ Ошибка возврата. Свяжитесь с админом.")
         return False
 
-def process_order(account, chat_id, username, stars, order_id):
+
+def process_order(account, chat_id, username, stars, order_id, quantity_multiplier=1):
     """Обрабатывает заказ и отправляет звезды через Fragment API"""
     clean_user = clean_username(username)
+    total_stars = stars * quantity_multiplier
 
     # Уведомление в Telegram о новом заказе
     send_telegram_notification(
         f"🛒 <b>НОВЫЙ ЗАКАЗ</b>\n"
         f"📋 ID: <code>{order_id}</code>\n"
         f"👤 Покупатель: @{clean_user}\n"
-        f"⭐ Звезд: <b>{stars}</b>\n"
+        f"⭐ Звезд: <b>{stars} в колличестве {quantity_multiplier} шт.</b>\n"
         f"💬 Чат: https://funpay.com/orders/{order_id}/\n"
         f"⏳ Обрабатывается..."
     )
@@ -206,12 +216,12 @@ def process_order(account, chat_id, username, stars, order_id):
     # Отправляем подтверждение покупателю
     account.send_message(chat_id, f"✅ Заказ принят в обработку!\n"
                                   f"👤 Username: @{clean_user}\n"
-                                  f"⭐ Звезд: {stars}\n"
+                                  f"⭐ Звезд: {stars} в колличестве {quantity_multiplier} шт.\n"
                                   f"⏰ Обработка займет несколько минут...")
 
     # Автоматически отправляем звезды
-    logger.info(f"⌛ Автоматическая отправка {stars} ⭐ пользователю @{clean_user}...")
-    success, response = direct_send_stars(FRAGMENT_TOKEN, clean_user, stars)
+    logger.info(f"⌛ Автоматическая отправка {total_stars} ⭐ пользователю @{clean_user}...")
+    success, response = direct_send_stars(FRAGMENT_TOKEN, clean_user, total_stars)
 
     if success:
         # Уведомление об успешной отправке
@@ -219,23 +229,24 @@ def process_order(account, chat_id, username, stars, order_id):
             f"✅ <b>ЗВЕЗДЫ ОТПРАВЛЕНЫ</b>\n"
             f"📋 ID заказа: <code>{order_id}</code>\n"
             f"👤 Получатель: @{clean_user}\n"
-            f"⭐ Отправлено: <b>{stars} ⭐</b>\n"
+            f"⭐ Отправлено: <b>{total_stars} ⭐</b>\n"
             f"🎉 Заказ выполнен успешно!"
         )
-        account.send_message(chat_id, f"✅ Успешно отправлено {stars} ⭐ пользователю @{clean_user}!")
-        logger.info(f"✅ @{clean_user} получил {stars} ⭐")
+        account.send_message(chat_id, f"✅ Успешно отправлено {total_stars} ⭐ пользователю @{clean_user}!")
+        logger.info(f"✅ @{clean_user} получил {total_stars} ⭐")
     else:
         short_error = parse_fragment_error(response)
         send_telegram_notification(
             f"❌ <b>ОШИБКА ОТПРАВКИ</b>\n"
             f"📋 ID заказа: <code>{order_id}</code>\n"
             f"👤 Получатель: @{clean_user}\n"
-            f"⭐ Звезд: <b>{stars}</b>\n"
+            f"⭐ Звезд: <b>{total_stars}</b>\n"
             f"⚠️ Ошибка: {short_error}\n"
             f"🔁 Оформляю возврат..."
         )
         account.send_message(chat_id, short_error + "\n🔁 Пытаюсь оформить возврат...")
         refund_order(account, order_id, chat_id)
+
 
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
@@ -244,15 +255,18 @@ def send_welcome(message):
                           "/balance - текущий баланс Fragment\n"
                           "/status - статус бота")
 
+
 @bot.message_handler(commands=['balance'])
 def send_balance(message):
     balance = get_fragment_balance()
     bot.reply_to(message, f"💰 Текущий баланс: <b>{balance} TON</b>", parse_mode='HTML')
 
+
 @bot.message_handler(commands=['status'])
 def send_status(message):
     bot.reply_to(message, "✅ Бот работает в штатном режиме\n"
                           "🤖 Мониторинг заказов активен")
+
 
 def start_telegram_bot():
     """Запускает Telegram бота в фоновом режиме"""
@@ -267,6 +281,7 @@ def start_telegram_bot():
     thread = threading.Thread(target=polling, daemon=True)
     thread.start()
     logger.info("✅ Telegram бот запущен в фоновом режиме")
+
 
 def main():
     global FRAGMENT_TOKEN
@@ -308,11 +323,13 @@ def main():
                     order = account.get_order(event.order.id)
                     username = None
                     stars = None
+                    quantity_multiplier = 1
 
                     if hasattr(order, 'buyer_params') and order.buyer_params:
                         username = clean_username(order.buyer_params.get("Telegram Username"))
 
                     if hasattr(order, 'lot_params') and order.lot_params:
+                        # Извлекаем количество звезд
                         for param in order.lot_params:
                             if param[0] == "Количество звёзд":
                                 stars_match = re.search(r"(\d+)", param[1])
@@ -320,11 +337,16 @@ def main():
                                     stars = int(stars_match.group(1))
                                 break
 
+                        # Извлекаем множитель количества
+                        quantity_multiplier = order.amount
+
                     if username and stars:
-                        print(f"\n🎯 Новый заказ - @{username} - {stars} звёзд")
+                        print(
+                            f"\n🎯 Новый заказ - @{username} - {stars} звёзд × {quantity_multiplier} = {stars * quantity_multiplier} звёзд")
                         print(f"📋 ID заказа: {order.id}")
+                        print(f"🔍 Параметры лота: {order.lot_params}")  # Добавим отладочную информацию
                         print("=" * 50)
-                        process_order(account, order.chat_id, username, stars, order.id)
+                        process_order(account, order.chat_id, username, stars, order.id, quantity_multiplier)
                         last_reply_time = now
                     else:
                         print(f"\n⚠️ Не удалось извлечь данные из заказа {order.id}")
@@ -332,6 +354,7 @@ def main():
                             print("❌ Username не найден")
                         if not stars:
                             print("❌ Количество звезд не найдено")
+                        print(f"🔍 Параметры лота: {order.lot_params}")
                         print("=" * 50)
 
                 except Exception as e:
@@ -351,6 +374,6 @@ def main():
         except Exception as e:
             logger.error(f"❌ Ошибка обработки события: {e}")
 
+
 if __name__ == "__main__":
     main()
-
