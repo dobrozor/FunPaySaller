@@ -5,19 +5,21 @@ import json
 import re
 import requests
 import telebot
-import lxml
-import requests_toolbelt
-import bs4
 from dotenv import load_dotenv
-from FunPayAPI import Account
+from FunPayAPI import Account, types  # Добавляем types
 from FunPayAPI.updater.runner import Runner
 from FunPayAPI.updater.events import NewOrderEvent, NewMessageEvent
+from queue import Queue  # Импортируем очередь
+import threading  # Для потока обработки очереди
 
 load_dotenv()
 
+# --- Константы и Настройка ---
 # Telegram bot
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_USER_ID = os.getenv("TELEGRAM_USER_ID")
+LOT_ID_TO_DEACTIVATE = os.getenv("LOT_ID_TO_DEACTIVATE")
+
 bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
 
 # Логгирование
@@ -27,7 +29,6 @@ logger = logging.getLogger(__name__)
 COOLDOWN_SECONDS = 1
 TOKEN_FILE = "auth_token.json"
 FRAGMENT_API_URL = "https://api.fragment-api.com/v1"
-waiting_for_nick = {}
 
 # Fragment auth
 FRAGMENT_TOKEN = None
@@ -35,6 +36,11 @@ FRAGMENT_API_KEY = os.getenv("FRAGMENT_API_KEY")
 FRAGMENT_PHONE = os.getenv("FRAGMENT_PHONE")
 FRAGMENT_MNEMONICS = os.getenv("FRAGMENT_MNEMONICS")
 
+# Очередь для обработки заказов (FIFO)
+order_queue = Queue()
+
+
+# --- Вспомогательные функции ---
 
 def clean_username(username):
     """Очищает username от лишних символов @"""
@@ -47,7 +53,6 @@ def send_telegram_notification(message):
     """Отправляет уведомление в Telegram"""
     try:
         bot.send_message(TELEGRAM_USER_ID, message, parse_mode='HTML')
-        logger.info("✅ Уведомление отправлено в Telegram")
     except Exception as e:
         logger.error(f"❌ Ошибка отправки в Telegram: {e}")
 
@@ -86,6 +91,12 @@ def save_fragment_token(token):
 
 
 def authenticate_fragment():
+    global FRAGMENT_TOKEN
+    FRAGMENT_TOKEN = load_fragment_token()
+    if FRAGMENT_TOKEN:
+        logger.info("✅ Токен Fragment загружен из файла.")
+        return FRAGMENT_TOKEN
+
     try:
         mnemonics_list = FRAGMENT_MNEMONICS.strip().split()
         payload = {
@@ -115,27 +126,8 @@ def authenticate_fragment():
         return None
 
 
-def check_username_exists(username):
-    global FRAGMENT_TOKEN
-    clean_user = clean_username(username)
-    url = f"{FRAGMENT_API_URL}/misc/user/{clean_user}/"
-    headers = {
-        "Accept": "application/json",
-        "Authorization": f"JWT {FRAGMENT_TOKEN}"
-    }
-    try:
-        res = requests.get(url, headers=headers)
-        if res.status_code == 200:
-            data = res.json()
-            return "username" in data
-        else:
-            return False
-    except Exception as e:
-        logger.error(f"❌ Ошибка при проверке ника: {e}")
-        return False
-
-
 def direct_send_stars(token, username, quantity):
+    """Отправляет звезды через Fragment API"""
     try:
         clean_user = clean_username(username)
         data = {"username": clean_user, "quantity": quantity, "show_sender": "false"}
@@ -152,54 +144,70 @@ def direct_send_stars(token, username, quantity):
 
 
 def parse_fragment_error(response_text):
+    """Парсит ошибку Fragment API и возвращает удобное сообщение."""
     try:
         data = json.loads(response_text)
     except:
-        return "❌ Неизвестная ошибка."
+        return "❌ Неизвестная ошибка Fragment API", False  # False - не ошибка "нет звезд"
 
     if isinstance(data, dict):
         if "username" in data:
-            return "❌ Неверный Telegram-тег. Сейчас оформим возврат средств."
+            return "❌ Неверный Telegram-тег. Проверьте правильность тега и напишите в чат.", False
         if "quantity" in data:
-            return "❌ Минимум 50 ⭐ для покупки. Сейчас оформим возврат средств."
+            return "❌ Минимум 50 ⭐ для покупки. Заказ отменен. Проверьте лот.", False
         if "errors" in data:
             for err in data["errors"]:
                 if "Not enough funds" in err.get("error", ""):
-                    return "❌ Извините, у нас резко закончились звёзды. Сейчас оформим возврат средств."
-    if isinstance(data, list):
-        if any("Unknown error" in str(e) for e in data):
-            return "❌ Неизвестная ошибка. Сейчас оформим возврат средств."
-    return "❌ Ошибка обработки заказа."
+                    # Это критическая ошибка, требующая деактивации лота
+                    return "❌ Извините, у нас закончились звёзды. Лот будет деактивирован", True
+
+    # Если ошибка не распознана, отправляем полный текст ошибки в Telegram
+    send_telegram_notification(f"⚠️ **Неизвестная ошибка Fragment** при отправке: {response_text}")
+    return "❌ Неизвестная ошибка. Ожидайте ответа.", False
 
 
-def refund_order(account, order_id, chat_id):
+def deactivate_lot(account):
+    """Деактивирует лот на FunPay при критической ошибке."""
+    if not LOT_ID_TO_DEACTIVATE:
+        logger.error("❌ Не удалось деактивировать лот: LOT_ID_TO_DEACTIVATE не установлен.")
+        return False
+
     try:
-        account.refund(order_id)
-        logger.info(f"✔️ Возврат оформлен для заказа {order_id}")
+        # 1. Получение полей лота
+        lot_fields: types.LotFields = account.get_lot_fields(lot_id=LOT_ID_TO_DEACTIVATE)
 
-        # Уведомление в Telegram о возврате
+        if not lot_fields.active:
+            logger.info("❗ Лот уже деактивирован.")
+            return True
+
+        # 2. Деактивация лота
+        lot_fields.active = False
+        lot_fields.renew_fields()
+        account.save_lot(lot_fields)
+
+        logger.info(f"✅ Лот ID {LOT_ID_TO_DEACTIVATE} успешно деактивирован.")
         send_telegram_notification(
-            f"↩️ <b>ВОЗВРАТ СРЕДСТВ</b>\n"
-            f"📋 ID заказа: <code>{order_id}</code>\n"
-            f"💬 Чат: https://funpay.com/orders/{order_id}/\n"
-            f"✅ Средства успешно возвращены покупателю"
+            f"⛔️ <b>ЛОТ ДЕАКТИВИРОВАН!</b>\n"
+            f"📋 ID: <code>{LOT_ID_TO_DEACTIVATE}</code> - {lot_fields.title_ru}\n"
+            f"Причина: Закончились звезды на Fragment. Пополните баланс."
         )
-        account.send_message(chat_id, "✅ Средства успешно возвращены.")
         return True
+
     except Exception as e:
-        logger.error(f"❌ Не удалось вернуть средства за заказ {order_id}: {e}")
+        logger.error(f"❌ Ошибка деактивации лота {LOT_ID_TO_DEACTIVATE}: {e}")
         send_telegram_notification(
-            f"❌ <b>ОШИБКА ВОЗВРАТА</b>\n"
-            f"📋 ID заказа: <code>{order_id}</code>\n"
-            f"💬 Чат: https://funpay.com/orders/{order_id}/\n"
+            f"❌ <b>КРИТИЧЕСКАЯ ОШИБКА ДЕАКТИВАЦИИ ЛОТА</b>\n"
+            f"📋 ID: <code>{LOT_ID_TO_DEACTIVATE}</code>\n"
             f"⚠️ Ошибка: {str(e)[:100]}..."
         )
-        account.send_message(chat_id, "❌ Ошибка возврата. Свяжитесь с админом.")
         return False
 
 
-def process_order(account, chat_id, username, stars, order_id, quantity_multiplier=1):
-    """Обрабатывает заказ и отправляет звезды через Fragment API"""
+def process_order(account, chat_id, username, stars, order_id, quantity_multiplier):
+    """
+    Обрабатывает заказ, отправляет звезды через Fragment API.
+    """
+    global FRAGMENT_TOKEN
     clean_user = clean_username(username)
     total_stars = stars * quantity_multiplier
 
@@ -208,7 +216,7 @@ def process_order(account, chat_id, username, stars, order_id, quantity_multipli
         f"🛒 <b>НОВЫЙ ЗАКАЗ</b>\n"
         f"📋 ID: <code>{order_id}</code>\n"
         f"👤 Покупатель: @{clean_user}\n"
-        f"⭐ Звезд: <b>{stars} в колличестве {quantity_multiplier} шт.</b>\n"
+        f"⭐ Звезд: <b>{total_stars} ⭐</b>\n"
         f"💬 Чат: https://funpay.com/orders/{order_id}/\n"
         f"⏳ Обрабатывается..."
     )
@@ -216,8 +224,8 @@ def process_order(account, chat_id, username, stars, order_id, quantity_multipli
     # Отправляем подтверждение покупателю
     account.send_message(chat_id, f"✅ Заказ принят в обработку!\n"
                                   f"👤 Username: @{clean_user}\n"
-                                  f"⭐ Звезд: {stars} в колличестве {quantity_multiplier} шт.\n"
-                                  f"⏰ Обработка займет несколько минут...")
+                                  f"⭐ Звезд: {total_stars} ⭐\n"
+                                  f"⏰ Обработка займет некоторое время...")
 
     # Автоматически отправляем звезды
     logger.info(f"⌛ Автоматическая отправка {total_stars} ⭐ пользователю @{clean_user}...")
@@ -235,18 +243,52 @@ def process_order(account, chat_id, username, stars, order_id, quantity_multipli
         account.send_message(chat_id, f"✅ Успешно отправлено {total_stars} ⭐ пользователю @{clean_user}!")
         logger.info(f"✅ @{clean_user} получил {total_stars} ⭐")
     else:
-        short_error = parse_fragment_error(response)
+        # Ошибка отправки
+        error_message, is_out_of_stars = parse_fragment_error(response)
+
         send_telegram_notification(
             f"❌ <b>ОШИБКА ОТПРАВКИ</b>\n"
             f"📋 ID заказа: <code>{order_id}</code>\n"
             f"👤 Получатель: @{clean_user}\n"
             f"⭐ Звезд: <b>{total_stars}</b>\n"
-            f"⚠️ Ошибка: {short_error}\n"
-            f"🔁 Оформляю возврат..."
+            f"⚠️ Ошибка: {error_message}"
         )
-        account.send_message(chat_id, short_error + "\n🔁 Пытаюсь оформить возврат...")
-        refund_order(account, order_id, chat_id)
 
+        # Отправляем ошибку в FunPay чат
+        account.send_message(chat_id, f"❌ **Произошла ошибка при отправке звезд:**\n{error_message}\n"
+                                      f"Просьба подождать, администратор скоро свяжется с вами для решения проблемы.")
+
+        logger.error(f"❌ Ошибка отправки ⭐ для заказа {order_id}: {error_message}")
+
+        # Проверяем, нужно ли деактивировать лот
+        if is_out_of_stars:
+            deactivate_lot(account)
+
+
+# --- Логика очереди ---
+
+def order_worker(account):
+    """Поток для обработки заказов из очереди."""
+    while True:
+        # Ожидаем новый заказ
+        order_data = order_queue.get()
+        if order_data is None:  # Сигнал для завершения потока
+            break
+
+        chat_id, username, stars, order_id, quantity_multiplier = order_data
+
+        # Обработка заказа
+        try:
+            process_order(account, chat_id, username, stars, order_id, quantity_multiplier)
+        except Exception as e:
+            logger.error(f"❌ Критическая ошибка в обработчике очереди заказа {order_id}: {e}")
+
+        # Сообщаем, что задача выполнена
+        order_queue.task_done()
+        time.sleep(COOLDOWN_SECONDS)  # Небольшая задержка между заказами
+
+
+# --- Telegram Bot ---
 
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
@@ -258,19 +300,27 @@ def send_welcome(message):
 
 @bot.message_handler(commands=['balance'])
 def send_balance(message):
+    if str(message.chat.id) != TELEGRAM_USER_ID: return  # Только для админа
     balance = get_fragment_balance()
     bot.reply_to(message, f"💰 Текущий баланс: <b>{balance} TON</b>", parse_mode='HTML')
 
 
 @bot.message_handler(commands=['status'])
 def send_status(message):
-    bot.reply_to(message, "✅ Бот работает в штатном режиме\n"
-                          "🤖 Мониторинг заказов активен")
+    if str(message.chat.id) != TELEGRAM_USER_ID: return  # Только для админа
+    status_message = "✅ Бот работает в штатном режиме\n"
+    status_message += f"🤖 Мониторинг заказов активен\n"
+    status_message += f"⏳ Заказов в очереди: {order_queue.qsize()}"
+    if LOT_ID_TO_DEACTIVATE:
+        status_message += f"\n🔗 ID контролируемого лота: {LOT_ID_TO_DEACTIVATE}"
+    else:
+        status_message += "\n⚠️ LOT_ID_TO_DEACTIVATE не установлен в .env!"
+
+    bot.reply_to(message, status_message)
 
 
 def start_telegram_bot():
     """Запускает Telegram бота в фоновом режиме"""
-    import threading
 
     def polling():
         try:
@@ -283,41 +333,47 @@ def start_telegram_bot():
     logger.info("✅ Telegram бот запущен в фоновом режиме")
 
 
+# --- Основной запуск ---
+
 def main():
-    global FRAGMENT_TOKEN
     golden_key = os.getenv("FUNPAY_AUTH_TOKEN")
     if not golden_key:
         logger.error("❌ FUNPAY_AUTH_TOKEN не найден в .env")
         return
 
+    if not LOT_ID_TO_DEACTIVATE:
+        logger.warning("⚠️ LOT_ID_TO_DEACTIVATE не установлен в .env. Автоматическая деактивация лота невозможна.")
+
     # Запускаем Telegram бота
     start_telegram_bot()
 
-    account = Account(golden_key)
-    account.get()
-
+    # Авторизация FunPay
+    account = Account(golden_key=golden_key).get()
     if not account.username:
-        logger.error("❌ Не удалось получить имя пользователя. Проверьте токен.")
+        logger.error("❌ Не удалось получить имя пользователя FunPay. Проверьте токен.")
         return
 
-    logger.info(f"✅ Авторизован как {account.username}")
-    runner = Runner(account)
+    logger.info(f"✅ Авторизован FunPay как {account.username}")
 
-    FRAGMENT_TOKEN = load_fragment_token() or authenticate_fragment()
+    # Авторизация Fragment
+    global FRAGMENT_TOKEN
+    FRAGMENT_TOKEN = authenticate_fragment()
     if not FRAGMENT_TOKEN:
-        logger.error("❌ Не удалось авторизоваться в Fragment.")
+        logger.error("❌ Не удалось авторизоваться в Fragment. Бот FunPay не запускается.")
         return
+
+    # Запуск потока обработки очереди
+    worker = threading.Thread(target=order_worker, args=(account,), daemon=True)
+    worker.start()
+    logger.info("✅ Поток обработки заказов запущен.")
 
     logger.info("🤖 Бот запущен. Ожидание заказов на звезды...")
 
-    last_reply_time = 0
+    runner = Runner(account)
 
     for event in runner.listen(requests_delay=3.0):
         try:
-            now = time.time()
-            if now - last_reply_time < COOLDOWN_SECONDS:
-                continue
-
+            # Обработка нового заказа
             if isinstance(event, NewOrderEvent):
                 try:
                     order = account.get_order(event.order.id)
@@ -325,49 +381,43 @@ def main():
                     stars = None
                     quantity_multiplier = 1
 
+                    # Извлечение данных заказа
                     if hasattr(order, 'buyer_params') and order.buyer_params:
                         username = clean_username(order.buyer_params.get("Telegram Username"))
 
                     if hasattr(order, 'lot_params') and order.lot_params:
-                        # Извлекаем количество звезд
                         for param in order.lot_params:
                             if param[0] == "Количество звёзд":
                                 stars_match = re.search(r"(\d+)", param[1])
                                 if stars_match:
                                     stars = int(stars_match.group(1))
                                 break
-
-                        # Извлекаем множитель количества
                         quantity_multiplier = order.amount
 
                     if username and stars:
-                        print(
-                            f"\n🎯 Новый заказ - @{username} - {stars} звёзд × {quantity_multiplier} = {stars * quantity_multiplier} звёзд")
-                        print(f"📋 ID заказа: {order.id}")
-                        print(f"🔍 Параметры лота: {order.lot_params}")  # Добавим отладочную информацию
+                        total_stars = stars * quantity_multiplier
+                        print(f"\n🎯 Новый заказ добавлен в очередь: @{username} - {total_stars} ⭐ (ID: {order.id})")
                         print("=" * 50)
-                        process_order(account, order.chat_id, username, stars, order.id, quantity_multiplier)
-                        last_reply_time = now
+
+                        # 1. Добавление заказа в очередь
+                        order_queue.put((order.chat_id, username, stars, order.id, quantity_multiplier))
+
                     else:
-                        print(f"\n⚠️ Не удалось извлечь данные из заказа {order.id}")
-                        if not username:
-                            print("❌ Username не найден")
-                        if not stars:
-                            print("❌ Количество звезд не найдено")
-                        print(f"🔍 Параметры лота: {order.lot_params}")
+                        print(f"\n⚠️ Не удалось извлечь данные из заказа {order.id}. Игнорирую.")
                         print("=" * 50)
 
                 except Exception as e:
                     logger.error(f"❌ Ошибка при получении информации о заказе: {e}")
                     continue
 
+            # Обработка нового сообщения
             elif isinstance(event, NewMessageEvent):
                 msg = event.message
                 if msg.author_id != account.id:
                     send_telegram_notification(
                         f"💬 <b>НОВОЕ СООБЩЕНИЕ</b>\n"
                         f"👤 От: <code>{msg.author}</code>\n"
-                        f"💬 Чат: <code>{msg.chat_id}</code>\n"
+                        f"💬 Чат: https://funpay.com/orders/{msg.chat_id}/\n"  # Ссылка на чат заказа
                         f"📝 Текст: {msg.text[:100]}..."
                     )
 
