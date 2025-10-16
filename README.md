@@ -18,6 +18,10 @@ _ym_uid=1753231107536229535; _ym_d=1753312307; _gcl_au=1.1.9434436.1753611210; _
 ```
 Нас интересует golden_key=m1tt1231238y8x9zar1ksq2noier46; Собственно вот и наш **FUNPAY_AUTH_TOKEN** это **m1tt1231238y8x9zar1ksq2noier46**
 
+### Где взять **LOT_ID_TO_DEACTIVATE**. 
+1. Создаем наш лот (например 50 звезд по username). Вы его заполняете как вам угодно
+2. Заходим на ваш лот, ссылка должна быть вида: https://funpay.com/lots/offer?id=1234567. Вот как раз 1234567 нам и нужно, это и есть ваш LOT_ID_TO_DEACTIVATE
+
 ### Где взять **FRAGMENT_API_KEY**. 
 1. Переходим на сайт апи https://fragment-api.com/signin и авторизируемся через наш телеграмм
 2. После авторизации идем на сайт https://fragment-api.com/dashboard и в влкадке API key и будет наш **FRAGMENT_API_KEY** он имеет вид: **4f5123d8-1e3e-4223-8c94-36b1235dae1**
